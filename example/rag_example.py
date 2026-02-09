@@ -13,7 +13,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings import HuggingFaceEmbeddings
 from langchain.vectorstores import Chroma
 from langchain.chains import RetrievalQA
-from langchain.chat_models import ChatOpenAI
+from langchain.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.document_loaders import TextLoader, UnstructuredMarkdownLoader
@@ -29,8 +29,11 @@ class RAGConfig:
     vector_store_path: str = "./chroma_db"
     collection_name: str = "knowledge_base"
     search_k: int = 3
-    llm_model: str = "gpt-3.5-turbo"
+    # Ollama configuration
+    llm_model: str = "mistral"  # 3B-7B GPT-like models: mistral, neural-chat, orca-mini:3b, phi
+    ollama_base_url: str = "http://localhost:11434"
     llm_temperature: float = 0.1
+    generation_mode: str = "simple"  # "simple" (direct) or "chain" (RetrievalQA)
 
 class MiniRAGSystem:
     """Полнофункциональная мини-RAG система"""
@@ -84,28 +87,26 @@ class MiniRAGSystem:
         )
     
     def _init_llm(self):
-        """Инициализация LLM (с фолбэком на локальную)"""
+        """Инициализация LLM с Ollama (локальная self-hosted модель)"""
         try:
-            # Пробуем использовать OpenAI
-            self.llm = ChatOpenAI(
-                model_name=self.config.llm_model,
+            # Используем Ollama для локальной self-hosted модели
+            self.llm = Ollama(
+                base_url=self.config.ollama_base_url,
+                model=self.config.llm_model,
                 temperature=self.config.llm_temperature,
-                max_retries=2,
-                request_timeout=30
+                top_k=40,
+                top_p=0.9,
             )
+            # Проверяем доступность модели
+            print(f"✅ Ollama подключена: {self.config.llm_model} @ {self.config.ollama_base_url}")
         except Exception as e:
-            print(f"⚠️  OpenAI недоступен, используем локальную модель: {e}")
-            # Фолбэк на локальную модель через HuggingFace
-            from langchain.llms import HuggingFacePipeline
-            from transformers import pipeline
-            
-            hf_pipeline = pipeline(
-                "text-generation",
-                model="google/flan-t5-base",
-                max_length=512,
-                temperature=0.3
-            )
-            self.llm = HuggingFacePipeline(pipeline=hf_pipeline)
+            print(f"❌ Ошибка подключения к Ollama: {e}")
+            print("⚠️  Пожалуйста убедитесь что Ollama запущена:")
+            print("    macOS/Linux: ollama serve")
+            print("    Windows: запустите приложение Ollama")
+            print("    Скачать: https://ollama.ai")
+            print(f"    Загрузить модель: ollama pull {self.config.llm_model}")
+            raise
     
     def _init_prompt(self):
         """Инициализация промпт-шаблона"""
@@ -124,6 +125,39 @@ class MiniRAGSystem:
 Ответ (будь краток и точен):
 """
         )
+
+    def _generate_answer_simple(self, context: str, question: str) -> str:
+        """
+        Простой и легкий метод генерации ответа без RetrievalQA цепочки
+        Прямой вызов LLM с отформатированным промптом
+        """
+        # Форматируем промпт преимущественно
+        prompt = self.prompt_template.format(context=context, question=question)
+
+        # Вызываем LLM напрямую
+        try:
+            # Для ChatOpenAI
+            if hasattr(self.llm, 'predict'):
+                answer = self.llm.predict(prompt)
+            # Для HuggingFacePipeline и других моделей
+            else:
+                from langchain.schema import HumanMessage
+                messages = [HumanMessage(content=prompt)]
+                response = self.llm.generate(messages)
+                answer = response.generations[0][0].text
+        except Exception as e:
+            # Как fallback используем invoke если доступен
+            try:
+                response = self.llm.invoke(prompt)
+                if hasattr(response, 'content'):
+                    answer = response.content
+                else:
+                    answer = str(response)
+            except Exception as e2:
+                answer = f"Ошибка при генерировании ответа: {str(e2)}"
+
+        return answer.strip() if answer else "Не удалось сгенерировать ответ"
+
     
     def add_document(self, text: str, metadata: Optional[Dict] = None) -> List[str]:
         """
@@ -205,17 +239,17 @@ class MiniRAGSystem:
         Возвращает полную информацию о результатах
         """
         search_k = k or self.config.search_k
-        
+
         # 1. Поиск релевантных чанков
         relevant_docs = self.vector_store.similarity_search_with_score(
-            question, 
+            question,
             k=search_k
         )
-        
+
         # 2. Форматирование контекста
         context_parts = []
         sources = []
-        
+
         for i, (doc, score) in enumerate(relevant_docs):
             context_parts.append(
                 f"[Документ {i+1}, релевантность: {score:.3f}]:\n{doc.page_content}"
@@ -225,41 +259,48 @@ class MiniRAGSystem:
                 "metadata": doc.metadata,
                 "score": float(score)
             })
-        
+
         context = "\n\n".join(context_parts)
-        
-        # 3. Генерация ответа через цепочку LangChain
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=self.vector_store.as_retriever(
-                search_kwargs={"k": search_k}
-            ),
-            chain_type_kwargs={"prompt": self.prompt_template},
-            return_source_documents=True
-        )
-        
-        result = qa_chain({"query": question})
-        
+
+        # 3. Генерация ответа
+        if self.config.generation_mode == "simple":
+            # Используем простой и легкий метод генерации
+            answer = self._generate_answer_simple(context, question)
+        else:
+            # Используем RetrievalQA цепочку (исходный метод)
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=self.llm,
+                chain_type="stuff",
+                retriever=self.vector_store.as_retriever(
+                    search_kwargs={"k": search_k}
+                ),
+                chain_type_kwargs={"prompt": self.prompt_template},
+                return_source_documents=True
+            )
+
+            result = qa_chain({"query": question})
+            answer = result["result"]
+
         # 4. Форматирование ответа
         response = {
             "question": question,
-            "answer": result["result"],
+            "answer": answer,
             "sources": sources,
+            "generation_mode": self.config.generation_mode,
             "stats": {
                 "docs_retrieved": len(relevant_docs),
                 "avg_relevance_score": (
-                    sum(score for _, score in relevant_docs) / len(relevant_docs) 
+                    sum(score for _, score in relevant_docs) / len(relevant_docs)
                     if relevant_docs else 0
                 ),
                 "context_length": len(context)
             },
             "raw_context": context if len(context) < 1000 else context[:1000] + "..."
         }
-        
+
         # Обновляем статистику
         self.stats["queries_processed"] += 1
-        
+
         return response
     
     def search_similar(self, query: str, k: int = 5) -> List[Dict]:
@@ -338,19 +379,20 @@ class MiniRAGSystem:
 def demo_rag_system():
     """Демонстрация работы RAG системы"""
     print("🚀 Запуск демонстрации Mini-RAG системы...\n")
-    
+
     # 1. Инициализация системы
     config = RAGConfig(
         chunk_size=800,
         chunk_overlap=150,
         embedding_model="sentence-transformers/all-MiniLM-L6-v2",
-        llm_model="gpt-3.5-turbo"  # или "local" для локальной модели
+        llm_model="mistral",  # Самохостед модель через Ollama
+        ollama_base_url="http://localhost:11434"
     )
-    
+
     rag = MiniRAGSystem(config)
     print("✅ RAG система инициализирована")
     print(f"📊 Конфигурация: чанки {config.chunk_size}/{config.chunk_overlap}")
-    print(f"🤖 Модель: {config.embedding_model}\n")
+    print(f"🤖 Модель: {config.embedding_model} + Ollama ({config.llm_model})\n")
     
     # 2. Добавление тестовых документов
     test_docs = [
@@ -427,27 +469,50 @@ def demo_rag_system():
     
     # 3. Выполнение запросов
     print("\n🔍 Выполнение тестовых запросов...\n")
-    
+
     test_queries = [
         "Как мы деплоим микросервисы?",
         "Что нужно сделать новому сотруднику?",
         "Как работает аутентификация в нашей системе?",
         "Какие инструменты мониторинга мы используем?"
     ]
-    
-    for query in test_queries:
-        print(f"❓ Вопрос: {query}")
+
+    print("=" * 60)
+    print("ТЕСТИРОВАНИЕ ПРОСТОГО МЕТОДА ГЕНЕРАЦИИ (small LLM)")
+    print("=" * 60)
+    for query in test_queries[:2]:  # Первые два запроса через простой метод
+        print(f"\n❓ Вопрос: {query}")
         result = rag.query(query, k=2)
-        
+
         print(f"💡 Ответ: {result['answer'][:150]}...")
         print(f"📈 Релевантность: {result['stats']['avg_relevance_score']:.3f}")
-        
+        print(f"⚙️  Режим генерации: {result['generation_mode']}")
+
         if result['sources']:
             print(f"📚 Источники:")
             for i, source in enumerate(result['sources'][:2]):
                 print(f"  {i+1}. [{source['metadata'].get('title', 'No title')}] "
                       f"(score: {source['score']:.3f})")
-        print()
+
+    # Переключаемся на цепочку для сравнения
+    print("\n" + "=" * 60)
+    print("ТЕСТИРОВАНИЕ МЕТОДА С ЦЕПОЧКОЙ (RetrievalQA)")
+    print("=" * 60)
+    rag.config.generation_mode = "chain"
+
+    for query in test_queries[2:]:  # Следующие два запроса через цепочку
+        print(f"\n❓ Вопрос: {query}")
+        result = rag.query(query, k=2)
+
+        print(f"💡 Ответ: {result['answer'][:150]}...")
+        print(f"📈 Релевантность: {result['stats']['avg_relevance_score']:.3f}")
+        print(f"⚙️  Режим генерации: {result['generation_mode']}")
+
+        if result['sources']:
+            print(f"📚 Источники:")
+            for i, source in enumerate(result['sources'][:2]):
+                print(f"  {i+1}. [{source['metadata'].get('title', 'No title')}] "
+                      f"(score: {source['score']:.3f})")
     
     # 4. Поиск похожих документов
     print("🔎 Поиск похожих документов...")
@@ -517,17 +582,29 @@ if __name__ == "__main__":
     # Пример использования извне
     print("\n📋 Пример использования в production:")
     print("""
-    # Инициализация
-    rag = MiniRAGSystem()
-    
+    # Инициализация с self-hosted моделью через Ollama
+    from langchain.llms import Ollama
+
+    config = RAGConfig(
+        llm_model="mistral",  # или другая модель
+        ollama_base_url="http://localhost:11434"
+    )
+    rag = MiniRAGSystem(config)
+
     # Добавление документов
     rag.add_document("Ваш текст документа", metadata={"source": "api"})
-    
+
     # Поиск ответа
     result = rag.query("Ваш вопрос")
     print(result['answer'])
-    
+
     # Мониторинг
     stats = rag.get_stats()
     print(f"Обработано запросов: {stats['queries_processed']}")
+
+    # Доступные модели в Ollama (3B-7B GPT-like):
+    # - mistral (7B, очень быстро и хорошо)
+    # - neural-chat (7B)
+    # - orca-mini:3b (3B, компактно)
+    # - phi (2.7B, очень быстро)
     """)
