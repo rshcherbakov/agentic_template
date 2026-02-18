@@ -11,22 +11,22 @@ import json
 
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import Chroma
+from langchain.vectorstores import Qdrant
 from langchain.chains import RetrievalQA
 from langchain.llms import Ollama
 from langchain.prompts import PromptTemplate
 from langchain.schema import Document
 from langchain.document_loaders import TextLoader, UnstructuredMarkdownLoader
-import chromadb
-from chromadb.config import Settings
+from qdrant_client import QdrantClient
 
 @dataclass
 class RAGConfig:
     """Конфигурация RAG системы"""
     chunk_size: int = 1000
     chunk_overlap: int = 200
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    vector_store_path: str = "./chroma_db"
+    embedding_model: str = "text-embedding-3-small"
+    # URL of the running Qdrant instance (default assumes local server)
+    vector_store_url: str = "http://localhost:6333"
     collection_name: str = "knowledge_base"
     search_k: int = 3
     # Ollama configuration
@@ -65,25 +65,43 @@ class MiniRAGSystem:
         )
     
     def _init_embeddings(self):
-        """Инициализация модели эмбеддингов"""
-        self.embeddings = HuggingFaceEmbeddings(
-            model_name=self.config.embedding_model,
-            model_kwargs={'device': 'cpu'},
-            encode_kwargs={'normalize_embeddings': True}
-        )
+        """Инициализация модели эмбеддингов.
+
+        Если конфигурация содержит ``text-embedding-3-small`` (или любой
+        другой идентификатор, по которому можно загрузить модель через
+        ``transformers``), используется собственный загрузчик из пакета
+        ``src.embedding``.  Это позволяет запускать модель полностью
+        локально без обращения к внешним сервисам.
+        """
+        # lazy import to avoid pulling the entire transformers stack when
+        # the default ``HuggingFaceEmbeddings`` is sufficient.
+        if self.config.embedding_model.startswith("text-embedding-3-small"):
+            from src.embedding.transformers_embeddings import TransformersEmbeddings
+
+            # ``TransformersEmbeddings`` implements ``__call__`` so it can be
+            # passed directly to LangChain vector stores as the
+            # ``embedding_function``.
+            self.embeddings = TransformersEmbeddings(self.config.embedding_model)
+        else:
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=self.config.embedding_model,
+                model_kwargs={"device": "cpu"},
+                encode_kwargs={"normalize_embeddings": True},
+            )
     
     def _init_vector_store(self):
-        """Инициализация векторного хранилища"""
-        # Создаем персистентное хранилище Chroma
-        self.vector_store = Chroma(
+        """Инициализация векторного хранилища через Qdrant"""
+        # подтягиваем qdrant-клиент (устанавливается из ``qdrant`` пакета)
+        self.qdrant_client = QdrantClient(url=self.config.vector_store_url)
+
+        # LangChain обёртка; она инкапсулирует ``client`` и обеспечивает
+        # единый интерфейс для хранилища.  По умолчанию она создаёт
+        # коллекцию при необходимости.
+        self.vector_store = Qdrant(
+            client=self.qdrant_client,
             collection_name=self.config.collection_name,
-            embedding_function=self.embeddings,
-            persist_directory=self.config.vector_store_path,
-            client_settings=Settings(
-                chroma_db_impl="duckdb+parquet",
-                persist_directory=self.config.vector_store_path,
-                anonymized_telemetry=False
-            )
+            embeddings=self.embeddings,
+            prefer_grpc=True,
         )
     
     def _init_llm(self):
@@ -344,21 +362,20 @@ class MiniRAGSystem:
     
     def get_stats(self) -> Dict:
         """Получить статистику системы"""
-        # Получаем количество документов в хранилище
+        # Получаем количество записей из Qdrant напрямую
         try:
-            collection = self.vector_store._collection
-            count = collection.count()
-        except:
+            count = self.qdrant_client.count(collection_name=self.config.collection_name).count
+        except Exception:
             count = 0
-        
+
         stats = self.stats.copy()
         stats.update({
             "total_chunks_in_store": count,
             "embedding_model": self.config.embedding_model,
             "chunk_size": self.config.chunk_size,
-            "vector_store_path": self.config.vector_store_path
+            "vector_store_url": self.config.vector_store_url,
         })
-        
+
         return stats
     
     def export_config(self) -> Dict:
@@ -368,10 +385,10 @@ class MiniRAGSystem:
             "stats": self.get_stats(),
             "components": {
                 "embeddings": self.config.embedding_model,
-                "vector_store": "ChromaDB",
+                "vector_store": "Qdrant",
                 "llm": self.config.llm_model,
-                "text_splitter": "RecursiveCharacterTextSplitter"
-            }
+                "text_splitter": "RecursiveCharacterTextSplitter",
+            },
         }
 
 # ==================== ДЕМОНСТРАЦИЯ РАБОТЫ ====================
